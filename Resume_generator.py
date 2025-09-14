@@ -1,81 +1,132 @@
-from transformers import pipeline, set_seed
-from dotenv import load_dotenv
 import os
 import re
+import torch
+import random
+import numpy as np
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, set_seed
+from dotenv import load_dotenv
 import PyPDF2
-from datetime import datetime
-import tempfile
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.lib.units import inch
+from typing import Optional
+
+# Set random seeds for reproducibility
+def set_all_seeds(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
 
 load_dotenv()
-set_seed(42)  # For reproducibility
+set_all_seeds(42)  # For reproducibility
 
 class ResumeGenerator:
-    def __init__(self, resume_path=None):
+    def __init__(self, resume_path: Optional[str] = None, model_path: str = "Qwen/Qwen1.5-1.8B"):
         self.model_initialized = False
         self.resume = resume_path or "resumes/GaneshResume.pdf"
+        self.model_path = model_path
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
         self.initialize_model()
     
     def initialize_model(self):
-        """Initialize the text generation model with error handling"""
+        """Initialize the Qwen 2B model with error handling"""
         try:
-            print("Initializing text generation model...")
-            # Use a smaller, more efficient model
-            self.generator = pipeline(
-                "text2text-generation",
-                model="google/flan-t5-small",  # Smaller, more efficient model
-                device=-1,  # Use CPU
-                max_length=500,
-                min_length=100,
-                do_sample=True,
-                temperature=0.7,
-                top_k=40,
-                top_p=0.9,
-                truncation=True
+            print("Initializing Qwen 2B model...")
+            
+            # Check if we have CUDA available
+            if torch.cuda.is_available():
+                print("CUDA is available. Using GPU acceleration.")
+                self.device = "cuda"
+            else:
+                print("CUDA not available. Using CPU (this will be slower).")
+                self.device = "cpu"
+            
+            # Initialize tokenizer and model
+            print("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                trust_remote_code=True
             )
+            
+            print("Loading model...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                device_map="auto",
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                trust_remote_code=True
+            )
+            
+            # Create text generation pipeline
+            self.generator = pipeline(
+                "text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                device=0 if self.device == "cuda" else -1,
+                model_kwargs={"device_map": "auto"}
+            )
+            
             self.model_initialized = True
-            print("Model initialized successfully")
+            print("Qwen 2B model initialized successfully")
+            
         except Exception as e:
             print(f"Error initializing model: {str(e)}")
+            print("Make sure you have enough GPU memory (at least 12GB recommended)")
+            print("or try running on CPU with more system RAM.")
             self.model_initialized = False
         
     def _create_prompt(self, job_desc, resume_content):
         """Create a prompt for the model to generate a tailored resume"""
         # Limit the resume content length to avoid hitting model's token limit
-        max_resume_length = 2000
+        max_resume_length = 100000  # Increased to preserve more context
         if len(resume_content) > max_resume_length:
-            resume_content = resume_content[:max_resume_length] + "... [truncated]"
+            # Try to keep sections intact when truncating
+            truncated = resume_content[:max_resume_length]
+            last_section = truncated.rfind('\n\n')
+            if last_section > 0:
+                truncated = truncated[:last_section] + "\n... [sections truncated for length]"
+            resume_content = truncated
             
         return f"""
-        TASK: Enhance the following resume to better match the job description while maintaining the original format and structure.
+        TASK: I need you to help me tailor my resume for a specific job application. 
+        I want to maintain the EXACT same structure, formatting, and content as my original resume, 
+        but make targeted improvements to better match the job description.
         
         JOB DESCRIPTION:
         {job_desc}
         
-        ORIGINAL RESUME:
+        MY ORIGINAL RESUME (PRESERVE THIS EXACT FORMATTING AND STRUCTURE):
         {resume_content}
         
         INSTRUCTIONS:
-        1. PRESERVE the exact original format, section order, and styling
-        2. KEEP all contact information, links (LinkedIn, LeetCode, GitHub) exactly as is
-        3. ENHANCE the TECHNICAL SKILLS section by:
-           - Adding any relevant skills from the job description
-           - Grouping skills in the same format as original (Languages, AI & Machine Learning, etc.)
-        4. For WORK EXPERIENCE and PROJECTS:
-           - Keep existing entries but enhance descriptions with relevant keywords
-           - Add any relevant experience that matches the job
-           - Use the same bullet point style and formatting
-        5. For EDUCATION and ACHIEVEMENTS:
-           - Keep all original information exactly as is
-           - Only add new achievements if highly relevant to the job
-        6. Maintain the same professional tone and concise writing style
-        7. Do NOT add any sections that weren't in the original resume
+        1. PRESERVE ALL original content, formatting, section order, and styling exactly as is
+        2. DO NOT change any contact information, dates, job titles, company names, or education details
+        3. For the SKILLS section:
+           - Keep all existing skills
+           - Only add new skills if they are explicitly mentioned in the job description and you're confident I have them
+           - Maintain the same categorization and formatting
         
-        ENHANCED RESUME:"""
+        4. For WORK EXPERIENCE and PROJECTS:
+           - Keep all original bullet points exactly as written
+           - Only modify/expand bullet points that directly relate to the job requirements
+           - When enhancing bullet points, maintain the same style and level of detail
+           - Add 1-2 new bullet points per role if they strongly match the job requirements
+        
+        5. DO NOT make up any information or experience I don't have
+        6. Keep the same professional tone and writing style throughout
+        7. If the job description mentions specific technologies or requirements that I don't have in my resume, 
+           highlight relevant transferable skills instead of adding new ones
+        
+        Return the ENTIRE resume with minimal changes, focusing only on the most relevant improvements.
+        Maintain all original section headers, formatting, and structure.
+        
+        TAILORED RESUME (same format as original, with minimal targeted changes):
+        """
     
     def _clean_generated_text(self, text, prompt):
         """Clean and format the generated text"""
@@ -524,60 +575,92 @@ if __name__ == "__main__":
     exit(main())
 
 
-def generate_resume(self, job_description: str) -> str:
-        # Read the resume content
+    def _extract_text_from_pdf(self, pdf_path):
+        """Extract and format text content from a PDF file"""
         try:
-            # Try with utf-8 first, fall back to other common encodings if needed
-            encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
-            resume_content = None
-            for encoding in encodings:
-                try:
-                    with open(self.resume, 'r', encoding=encoding) as f:
-                        resume_content = f.read()
-                    print(f"Successfully read resume with {encoding} encoding")
-                    break
-                except UnicodeDecodeError:
-                    print(f"Failed to read with {encoding} encoding, trying next...")
-                    continue
+            print(f"Extracting text from PDF: {pdf_path}")
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = []
+                
+                for page_num, page in enumerate(reader.pages, 1):
+                    page_text = page.extract_text()
+                    if page_text:
+                        # Clean up the text while preserving structure
+                        page_text = ' '.join(line.strip() for line in page_text.split('\n') if line.strip())
+                        text.append(page_text)
+                        
+                full_text = '\n\n'.join(text)
+                print(f"Extracted {len(full_text)} characters from PDF")
+                return full_text
+                
+        except Exception as e:
+            print(f"Error extracting text from PDF: {str(e)}")
+            return None
+
+    def _clean_resume_text(self, text):
+        """Clean and normalize the resume text while preserving structure"""
+        if not text:
+            return ""
             
-            if resume_content is None:
-                # If all encodings fail, try with error handling
-                with open(self.resume, 'r', encoding='utf-8', errors='replace') as f:
-                    resume_content = f.read()
-                print("Used error handling to read resume")
+        # Normalize whitespace but keep paragraph breaks
+        lines = []
+        current_paragraph = []
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            if line:  # If line has content
+                current_paragraph.append(line)
+            elif current_paragraph:  # Empty line with previous content
+                lines.append(' '.join(current_paragraph))
+                current_paragraph = []
                 
-            if not resume_content.strip():
-                raise ValueError("Resume file is empty")
-                
-        except FileNotFoundError:
+        # Add the last paragraph if exists
+        if current_paragraph:
+            lines.append(' '.join(current_paragraph))
+            
+        # Join with double newlines to preserve paragraph structure
+        return '\n\n'.join(lines)
+
+    def generate_resume(self, job_description: str) -> str:
+        """
+        Generate a tailored resume based on the job description
+        
+        Args:
+            job_description: The job description to tailor the resume for
+            
+        Returns:
+            str: The generated resume text
+        """
+        # Read the resume content from PDF
+        if not os.path.exists(self.resume):
             error_msg = f"Resume file not found at: {self.resume}"
             print(error_msg)
             return error_msg
-        except Exception as e:
-            error_msg = f"Error reading resume: {str(e)}"
-            print(error_msg)
-            return error_msg
+            
+        print(f"\n{'='*50}")
+        print("RESUME TAILORING PROCESS")
+        print(f"{'='*50}")
+        print(f"Input resume: {os.path.abspath(self.resume)}")
         
-        # Create a more focused prompt
-        prompt = f"""
-        TASK: Tailor the following resume for the job description below.
+        # Extract text from PDF
+        print("\n1. Extracting text from resume...")
+        resume_content = self._extract_text_from_pdf(self.resume)
+        if not resume_content:
+            return "Error: Could not extract text from the resume PDF"
+            
+        # Clean up the resume text
+        print("2. Cleaning and formatting resume content...")
+        resume_content = self._clean_resume_text(resume_content)
         
-        JOB DESCRIPTION:
-        {job_description}
+        if not resume_content.strip():
+            return "Error: Extracted resume content is empty"
+            
+        print(f"3. Resume content prepared ({len(resume_content)} characters)")
         
-        CURRENT RESUME:
-        {resume_content}
-        
-        INSTRUCTIONS:
-        1. Keep the same format and structure as the original resume
-        2. add skills and experiences most relevant to the job
-        3. Use keywords from the job description
-        4. Keep all contact information and section headers
-        5. Make the resume more ATS-friendly
-        6. Be concise and professional
-        
-        TAILORED RESUME:
-        """
+        # Create the prompt for the model
+        print("4. Creating optimization prompt...")
+        prompt = self._create_prompt(job_description, resume_content)
         
         if not self.model_initialized:
             return "Error: Model initialization failed. Please check your setup and try again."
