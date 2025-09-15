@@ -1,111 +1,172 @@
 import os
 import re
-import torch
-import random
-import numpy as np
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, set_seed
+import json
+import requests
 from dotenv import load_dotenv
 import PyPDF2
+from huggingface_hub.inference._client import InferenceClient
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.lib.units import inch
-from typing import Optional
-
-# Set random seeds for reproducibility
-def set_all_seeds(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    set_seed(seed)
+from typing import Optional, Dict, Any
 
 load_dotenv()
-set_all_seeds(42)  # For reproducibility
 
 class ResumeGenerator:
-    def __init__(self, resume_path: Optional[str] = None, model_path: str = "Qwen/Qwen1.5-1.8B"):
+    def __init__(self, resume_path: Optional[str] = None, 
+                 model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"):  # Using a model that's known to work
         self.model_initialized = False
         self.resume = resume_path or "resumes/GaneshResume.pdf"
-        self.model_path = model_path
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {self.device}")
-        self.initialize_model()
-    
-    def initialize_model(self):
-        """Initialize the Qwen 2B model with error handling"""
+        self.api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+        
+        # Get API key from environment
+        self.api_key = os.getenv('HUGGINGFACEHUB_API_KEY')
+        if not self.api_key:
+            print("Error: HUGGINGFACEHUB_API_KEY not found in environment variables")
+            print("Please make sure your .env file contains HUGGINGFACEHUB_API_KEY=your_api_key")
+            return
+            
+        # Initialize the Hugging Face Inference client
         try:
-            print("Initializing Qwen 2B model...")
-            
-            # Check if we have CUDA available
-            if torch.cuda.is_available():
-                print("CUDA is available. Using GPU acceleration.")
-                self.device = "cuda"
-            else:
-                print("CUDA not available. Using CPU (this will be slower).")
-                self.device = "cpu"
-            
-            # Initialize tokenizer and model
-            print("Loading tokenizer...")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                trust_remote_code=True
-            )
-            
-            print("Loading model...")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                device_map="auto",
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                trust_remote_code=True
-            )
-            
-            # Create text generation pipeline
-            self.generator = pipeline(
-                "text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=0 if self.device == "cuda" else -1,
-                model_kwargs={"device_map": "auto"}
-            )
-            
+            self.client = InferenceClient(token=self.api_key, model=model_name)
+            print(f"Successfully initialized model: {model_name}")
             self.model_initialized = True
-            print("Qwen 2B model initialized successfully")
-            
         except Exception as e:
             print(f"Error initializing model: {str(e)}")
-            print("Make sure you have enough GPU memory (at least 12GB recommended)")
-            print("or try running on CPU with more system RAM.")
             self.model_initialized = False
-        
-    def _create_prompt(self, job_desc, resume_content):
-        """Create a prompt for the model to generate a tailored resume"""
-        # Limit the resume content length to avoid hitting model's token limit
-        max_resume_length = 100000  # Increased to preserve more context
-        if len(resume_content) > max_resume_length:
-            # Try to keep sections intact when truncating
-            truncated = resume_content[:max_resume_length]
-            last_section = truncated.rfind('\n\n')
-            if last_section > 0:
-                truncated = truncated[:last_section] + "\n... [sections truncated for length]"
-            resume_content = truncated
-            
+    
+    def _extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from a PDF file"""
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text() + "\n"
+                return text.strip()
+        except Exception as e:
+            print(f"Error reading PDF file: {str(e)}")
+            return ""
+
+    def _clean_resume_text(self, text: str) -> str:
+        """Clean and normalize the resume text"""
+        # Remove extra whitespace and normalize newlines
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\n+', '\n', text)
+        return text.strip()
+
+    def _create_prompt(self, job_description: str, resume_content: str) -> str:
+        """Create a prompt for the LLM to tailor the resume"""
         return f"""
-        TASK: I need you to help me tailor my resume for a specific job application. 
-        I want to maintain the EXACT same structure, formatting, and content as my original resume, 
-        but make targeted improvements to better match the job description.
+        Please tailor the following resume for the job description below. 
+        Focus on highlighting relevant skills and experiences.
         
         JOB DESCRIPTION:
-        {job_desc}
+        {job_description}
         
-        MY ORIGINAL RESUME (PRESERVE THIS EXACT FORMATTING AND STRUCTURE):
+        CURRENT RESUME:
         {resume_content}
         
-        INSTRUCTIONS:
-        1. PRESERVE ALL original content, formatting, section order, and styling exactly as is
-        2. DO NOT change any contact information, dates, job titles, company names, or education details
+        TAILORED RESUME:
+        """
+
+    def generate_text(self, prompt: str, max_new_tokens: int = 1024, temperature: float = 0.7) -> str:
+        """Generate text using the Hugging Face Inference API"""
+        if not self.model_initialized:
+            print("Error: Model not initialized")
+            return ""
+            
+        try:
+            response = self.client.text_generation(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                return_full_text=False
+            )
+            return response
+        except Exception as e:
+            print(f"Error generating text: {str(e)}")
+            return ""
+    
+    def generate_resume(self, job_description: str, output_path: Optional[str] = None) -> str:
+        """Generate a tailored resume based on the job description"""
+        if not self.model_initialized:
+            print("Error: Model not initialized")
+            return ""
+            
+        print("\nGenerating tailored resume...")
+        
+        try:
+            # Extract text from the resume
+            resume_content = self._extract_text_from_pdf(self.resume)
+            if not resume_content:
+                return "Error: Could not extract text from resume"
+                
+            # Clean the resume text
+            resume_content = self._clean_resume_text(resume_content)
+            
+            # Create the prompt
+            prompt = self._create_prompt(job_description, resume_content)
+            
+            # Generate the tailored resume
+            tailored_resume = self.generate_text(prompt)
+            
+            # Save to file if output path is provided
+            if output_path:
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(tailored_resume)
+                print(f"\n✅ Tailored resume saved to: {os.path.abspath(output_path)}")
+            
+            return tailored_resume
+            
+        except Exception as e:
+            print(f"Error generating resume: {str(e)}")
+            return ""
+    
+    def generate_resume_pdf(self, job_description: str, output_pdf: str) -> bool:
+        """Generate a PDF of the tailored resume"""
+        try:
+            # Generate the text content first
+            resume_text = self.generate_resume(job_description)
+            if not resume_text:
+                return False
+            
+            # Create a PDF document
+            doc = SimpleDocTemplate(
+                output_pdf,
+                pagesize=letter,
+                rightMargin=72, leftMargin=72,
+                topMargin=72, bottomMargin=18
+            )
+            
+            # Create styles
+            styles = getSampleStyleSheet()
+            styles.add(ParagraphStyle(
+                name='Normal_Center',
+                parent=styles['Normal'],
+                alignment=TA_CENTER,
+            ))
+            
+            # Prepare the content
+            content = []
+            
+            # Split the text into paragraphs and add to content
+            for para in resume_text.split('\n\n'):
+                if para.strip():
+                    content.append(Paragraph(para.strip(), styles['Normal']))
+                    content.append(Spacer(1, 12))
+            
+            # Build the document
+            doc.build(content)
+            print(f"\n✅ PDF resume saved to: {os.path.abspath(output_pdf)}")
+            return True
+            
+        except Exception as e:
+            print(f"Error generating PDF: {str(e)}")
+            return False
         3. For the SKILLS section:
            - Keep all existing skills
            - Only add new skills if they are explicitly mentioned in the job description and you're confident I have them
@@ -420,77 +481,42 @@ class ResumeGenerator:
             raise
         
     def generate_resume(self, job_description: str, output_pdf: str = None) -> str:
-        # Read the resume content
-        try:
-            # Check if file is a PDF
-            if self.resume.lower().endswith('.pdf'):
-                import PyPDF2
-                print(f"Reading PDF file: {self.resume}")
-                with open(self.resume, 'rb') as f:
-                    reader = PyPDF2.PdfReader(f)
-                    resume_content = ""
-                    for page in reader.pages:
-                        resume_content += page.extract_text() + "\n"
-                print("Successfully extracted text from PDF")
-            else:
-                # For text files, try with utf-8 first, fall back to other common encodings
-                encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
-                resume_content = None
-                for encoding in encodings:
-                    try:
-                        with open(self.resume, 'r', encoding=encoding) as f:
-                            resume_content = f.read()
-                        print(f"Successfully read resume with {encoding} encoding")
-                        break
-                    except UnicodeDecodeError:
-                        print(f"Failed to read with {encoding} encoding, trying next...")
-                        continue
-                
-                if resume_content is None:
-                    # If all encodings fail, try with error handling
-                    with open(self.resume, 'r', encoding='utf-8', errors='replace') as f:
-                        resume_content = f.read()
-                    print("Used error handling to read resume")
-            
-            if not resume_content.strip():
-                raise ValueError("Resume file is empty")
-                
-        except FileNotFoundError:
-            error_msg = f"Resume file not found at: {self.resume}"
-            print(error_msg)
-            return error_msg
-        except Exception as e:
-            error_msg = f"Error reading resume: {str(e)}"
-            print(error_msg)
-            return error_msg
+        """
+        Generate a tailored resume based on the job description using Hugging Face API
         
+        Args:
+            job_description: The job description to tailor the resume for
+            output_pdf: Optional path to save the generated PDF
+            
+        Returns:
+            str: The generated resume text
+        """
         if not self.model_initialized:
-            return "Error: Model initialization failed. Please check your setup and try again."
+            print("Error: Connection to Hugging Face API not initialized.")
+            return None
             
         try:
-            print("Generating tailored resume...")
+            # Read the resume content
+            resume_content = self._extract_text_from_pdf(self.resume)
+            if not resume_content:
+                print("Error: Could not read resume content.")
+                return None
+                
+            # Clean the resume content
+            resume_content = self._clean_resume_text(resume_content)
             
-            # Create a focused prompt with limited input
+            # Create the prompt
             prompt = self._create_prompt(job_description, resume_content)
             
-            # Generate response with controlled parameters
             try:
-                result = self.generator(
-                    prompt,
-                    max_length=500,
-                    min_length=100,
-                    num_return_sequences=1,
-                    temperature=0.7,
-                    top_k=40,
-                    top_p=0.9,
-                    do_sample=True,
-                    truncation=True
-                )
+                # Generate the tailored resume using the API
+                print("Generating tailored resume using Qwen 2.5 7B model via Hugging Face API...")
                 
-                if not result or not result[0].get('generated_text'):
-                    raise ValueError("Received empty response from the model")
-                    
-                generated_text = result[0]['generated_text']
+                # Use the generate_text method which handles the API call
+                generated_text = self.generate_text(prompt, max_new_tokens=1024, temperature=0.7)
+                
+                if not generated_text:
+                    raise ValueError("Failed to generate content from the API")
                 
                 # Clean and format the output
                 generated_text = self._clean_generated_text(generated_text, prompt)
@@ -499,12 +525,20 @@ class ResumeGenerator:
                 if len(generated_text) < 50:
                     raise ValueError("Generated response is too short")
                     
+                # If output_pdf is provided, save as PDF
+                if output_pdf:
+                    try:
+                        self._save_to_pdf(generated_text, output_pdf)
+                        print(f"Successfully saved PDF to: {os.path.abspath(output_pdf)}")
+                    except Exception as e:
+                        print(f"Warning: Could not save as PDF: {str(e)}")
+                
+                print("Successfully generated tailored resume")
+                return generated_text
+                
             except Exception as e:
                 print(f"Error during generation: {str(e)}")
                 raise
-            
-            print("Successfully generated tailored resume")
-            return generated_text
             
         except Exception as e:
             error_msg = f"Error generating resume: {str(e)}"
@@ -517,18 +551,32 @@ We encountered an issue generating a tailored resume. Here's what you can do:
 1. Check if your resume file is not empty and properly formatted
 2. Try again with a shorter job description
 3. Make sure you have a stable internet connection
+4. Verify your Hugging Face API token is valid and has access to the model
+5. Check if the model is available at {self.api_url}
 
 Original resume content:
 
-{resume_content[:1000]}{'...' if len(resume_content) > 1000 else ''}"""
+{resume_content[:1000] if 'resume_content' in locals() else 'Could not load resume content'}{'...' if 'resume_content' in locals() and len(resume_content) > 1000 else ''}"""
 
 
 def main():
-    """Main function to demonstrate resume generation"""
+    """Main function to demonstrate resume generation with Hugging Face API"""
     try:
+        # Check if Hugging Face API token is set
+        if not os.getenv('HUGGINGFACEHUB_API_KEY'):
+            print("Error: HUGGINGFACEHUB_API_KEY environment variable is not set in .env file.")
+            print("Please set it with your Hugging Face API token in the .env file.")
+            print("You can get your API token from: https://huggingface.co/settings/tokens")
+            return 1
+            
         # Initialize the resume generator
+        print("Initializing resume generator...")
         generator = ResumeGenerator()
         
+        if not generator.model_initialized:
+            print("Failed to initialize the model. Please check your API key and internet connection.")
+            return 1
+            
         # Sample job description (you can replace this with a real one)
         job_description = """
         We are looking for a skilled software engineer with experience in Python, 
@@ -536,39 +584,51 @@ def main():
         experience with cloud platforms and modern software development practices.
         """
         
-        # First, save the generated resume as a text file
-        output_txt = 'generated_resume.txt'
-        abs_output_txt = os.path.abspath(output_txt)
-        print(f"Will save generated resume to: {abs_output_txt}")
+        # Output files
+        output_txt = 'tailored_resume.txt'
+        output_pdf = 'tailored_resume.pdf'
+        
+        print("\n" + "="*50)
+        print("RESUME TAILORING TOOL")
+        print("="*50)
+        print(f"Resume: {os.path.abspath(generator.resume)}")
+        print(f"Output will be saved to: {os.path.abspath(output_txt)}")
         
         # Generate the resume
-        print("Generating resume tailored to the job description...")
-        generated_resume = generator.generate_resume(job_description)
+        print("\nGenerating tailored resume...")
+        generated_resume = generator.generate_resume(job_description, output_pdf=output_pdf)
+        
+        if not generated_resume or generated_resume.startswith("Error"):
+            print("\n❌ Failed to generate resume. Please check the error message above.")
+            return 1
         
         # Save the generated resume as a text file
-        with open(output_txt, 'w', encoding='utf-8') as f:
-            f.write(generated_resume)
-        
-        print(f"\nResume has been tailored and saved to '{output_txt}'")
-        
-        # Then try to save as PDF if needed
-        output_pdf = 'tailored_resume_output.pdf'
-        abs_output_pdf = os.path.abspath(output_pdf)
-        print(f"\nAttempting to save as PDF to: {abs_output_pdf}")
-        
         try:
-            generator._save_to_pdf(generated_resume, output_pdf)
-            print(f"PDF successfully saved to: {abs_output_pdf}")
+            with open(output_txt, 'w', encoding='utf-8') as f:
+                f.write(generated_resume)
+            print(f"\n✅ Success! Tailored resume has been saved to:")
+            print(f"Text file: {os.path.abspath(output_txt)}")
+            if os.path.exists(output_pdf):
+                print(f"PDF file:  {os.path.abspath(output_pdf)}")
+            
+            print("\nYou can now open these files to view your tailored resume!")
+            
         except Exception as e:
-            print(f"Warning: Could not save as PDF: {str(e)}")
-            print("The resume has been saved as a text file. You can view it at:")
-            print(f"  {abs_output_txt}")
+            print(f"\n⚠️  Generated resume but could not save to file: {str(e)}")
+            print("\nHere's the generated resume content:")
+            print("-"*50)
+            print(generated_resume)
         
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        return 0
+        
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
         return 1
-    
-    return 0
+    except Exception as e:
+        print(f"\n❌ An unexpected error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
@@ -622,73 +682,62 @@ if __name__ == "__main__":
         # Join with double newlines to preserve paragraph structure
         return '\n\n'.join(lines)
 
-    def generate_resume(self, job_description: str) -> str:
+    def generate_resume(self, job_description: str, output_pdf: str = None) -> str:
         """
-        Generate a tailored resume based on the job description
+        Generate a tailored resume based on the job description using Hugging Face API
         
         Args:
             job_description: The job description to tailor the resume for
+            output_pdf: Optional path to save the generated PDF
             
         Returns:
             str: The generated resume text
         """
-        # Read the resume content from PDF
-        if not os.path.exists(self.resume):
-            error_msg = f"Resume file not found at: {self.resume}"
+        if not self.model_initialized:
+            error_msg = "Error: Connection to Hugging Face API not initialized."
             print(error_msg)
             return error_msg
             
-        print(f"\n{'='*50}")
-        print("RESUME TAILORING PROCESS")
-        print(f"{'='*50}")
-        print(f"Input resume: {os.path.abspath(self.resume)}")
-        
-        # Extract text from PDF
-        print("\n1. Extracting text from resume...")
-        resume_content = self._extract_text_from_pdf(self.resume)
-        if not resume_content:
-            return "Error: Could not extract text from the resume PDF"
-            
-        # Clean up the resume text
-        print("2. Cleaning and formatting resume content...")
-        resume_content = self._clean_resume_text(resume_content)
-        
-        if not resume_content.strip():
-            return "Error: Extracted resume content is empty"
-            
-        print(f"3. Resume content prepared ({len(resume_content)} characters)")
-        
-        # Create the prompt for the model
-        print("4. Creating optimization prompt...")
-        prompt = self._create_prompt(job_description, resume_content)
-        
-        if not self.model_initialized:
-            return "Error: Model initialization failed. Please check your setup and try again."
-            
         try:
-            print("Generating tailored resume...")
+            # Check if resume file exists
+            if not os.path.exists(self.resume):
+                error_msg = f"Resume file not found at: {self.resume}"
+                print(error_msg)
+                return error_msg
+                
+            print(f"\n{'='*50}")
+            print("RESUME TAILORING PROCESS")
+            print(f"{'='*50}")
+            print(f"Input resume: {os.path.abspath(self.resume)}")
             
-            # Create a focused prompt with limited input
+            # Extract text from PDF
+            print("\n1. Extracting text from resume...")
+            resume_content = self._extract_text_from_pdf(self.resume)
+            if not resume_content:
+                return "Error: Could not extract text from the resume PDF"
+                
+            # Clean up the resume text
+            print("2. Cleaning and formatting resume content...")
+            resume_content = self._clean_resume_text(resume_content)
+            
+            if not resume_content.strip():
+                return "Error: Extracted resume content is empty"
+                
+            print(f"3. Resume content prepared ({len(resume_content)} characters)")
+            
+            # Create the prompt for the model
+            print("4. Creating optimization prompt...")
             prompt = self._create_prompt(job_description, resume_content)
             
-            # Generate response with controlled parameters
             try:
-                result = self.generator(
-                    prompt,
-                    max_length=500,
-                    min_length=100,
-                    num_return_sequences=1,
-                    temperature=0.7,
-                    top_k=40,
-                    top_p=0.9,
-                    do_sample=True,
-                    truncation=True
-                )
+                # Generate the tailored resume using the API
+                print("5. Generating tailored resume using Qwen 2.5 7B model...")
                 
-                if not result or not result[0].get('generated_text'):
-                    raise ValueError("Received empty response from the model")
-                    
-                generated_text = result[0]['generated_text']
+                # Use the generate_text method which handles the API call
+                generated_text = self.generate_text(prompt, max_new_tokens=1024, temperature=0.7)
+                
+                if not generated_text:
+                    raise ValueError("Failed to generate content from the API")
                 
                 # Clean and format the output
                 generated_text = self._clean_generated_text(generated_text, prompt)
@@ -697,12 +746,20 @@ if __name__ == "__main__":
                 if len(generated_text) < 50:
                     raise ValueError("Generated response is too short")
                     
+                # If output_pdf is provided, save as PDF
+                if output_pdf:
+                    try:
+                        self._save_to_pdf(generated_text, output_pdf)
+                        print(f"6. Successfully saved PDF to: {os.path.abspath(output_pdf)}")
+                    except Exception as e:
+                        print(f"Warning: Could not save as PDF: {str(e)}")
+                
+                print("\n✅ Successfully generated tailored resume!")
+                return generated_text
+                
             except Exception as e:
                 print(f"Error during generation: {str(e)}")
                 raise
-            
-            print("Successfully generated tailored resume")
-            return generated_text
             
         except Exception as e:
             error_msg = f"Error generating resume: {str(e)}"
